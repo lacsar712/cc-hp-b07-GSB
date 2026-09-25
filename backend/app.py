@@ -10,7 +10,7 @@ from passlib.context import CryptContext
 from pydantic import BaseModel, Field
 from psycopg.rows import dict_row
 
-from rules import judge
+from rules import fry_step, judge
 
 SECRET = os.environ.get("JWT_SECRET", "herb-process-dev-secret")
 DSN = os.environ.get("DATABASE_URL", "postgresql://app:app@localhost:54393/herb")
@@ -40,6 +40,11 @@ class StepIn(BaseModel):
 class BatchIn(BaseModel):
     herb: str = Field(min_length=1, max_length=80)
     steps: list[StepIn]
+
+
+class PairIn(BaseModel):
+    experiment_batch_id: int
+    control_batch_id: int
 
 
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict:
@@ -76,6 +81,22 @@ def startup():
                 created_by text NOT NULL,
                 created_at timestamptz NOT NULL
             )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS pot_pairs (
+                id serial PRIMARY KEY,
+                experiment_batch_id integer NOT NULL REFERENCES batches(id),
+                control_batch_id integer NOT NULL REFERENCES batches(id),
+                created_by text NOT NULL,
+                created_at timestamptz NOT NULL,
+                unbound_by text,
+                unbound_at timestamptz
+            )"""
+        )
+        conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS pot_pairs_active_uniq
+               ON pot_pairs (experiment_batch_id, control_batch_id)
+               WHERE unbound_at IS NULL"""
         )
         count = conn.execute("SELECT COUNT(*) AS n FROM batches").fetchone()["n"]
         if count == 0:
@@ -129,3 +150,103 @@ def create_batch(body: BatchIn, user: dict = Depends(require_writer)):
         ).fetchone()
         conn.commit()
     return row
+
+
+def pair_payload(conn, pair: dict) -> dict:
+    """把一条对照关系拼成专页要展示的对照包：两边工序 + 服务端算好的温度差与结论是否同向。"""
+    rows = conn.execute(
+        "SELECT id, herb, doc, verdict, reason FROM batches WHERE id = ANY(%s)",
+        ([pair["experiment_batch_id"], pair["control_batch_id"]],),
+    ).fetchall()
+    by_id = {r["id"]: r for r in rows}
+
+    def side(batch_id: int) -> dict:
+        b = by_id[batch_id]
+        step = fry_step(b["doc"]) or {}
+        return {
+            "batch_id": b["id"],
+            "herb": b["herb"],
+            "temp_c": step.get("temp_c"),
+            "minutes": step.get("minutes"),
+            "verdict": b["verdict"],
+            "reason": b["reason"],
+        }
+
+    experiment = side(pair["experiment_batch_id"])
+    control = side(pair["control_batch_id"])
+    temp_diff = None
+    if experiment["temp_c"] is not None and control["temp_c"] is not None:
+        temp_diff = round(float(experiment["temp_c"]) - float(control["temp_c"]), 2)
+    payload = {
+        "id": pair["id"],
+        "created_by": pair["created_by"],
+        "created_at": pair["created_at"],
+        "experiment": experiment,
+        "control": control,
+        "temp_diff": temp_diff,
+        "same_direction": experiment["verdict"] == control["verdict"],
+    }
+    if pair["unbound_at"] is not None:
+        payload["unbound_by"] = pair["unbound_by"]
+        payload["unbound_at"] = pair["unbound_at"]
+    return payload
+
+
+@app.get("/api/pairs")
+def list_pairs(_user: dict = Depends(current_user)):
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM pot_pairs WHERE unbound_at IS NULL ORDER BY id DESC"
+        ).fetchall()
+        return [pair_payload(conn, r) for r in rows]
+
+
+@app.get("/api/pairs/history")
+def pair_history(_user: dict = Depends(current_user)):
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM pot_pairs WHERE unbound_at IS NOT NULL ORDER BY unbound_at DESC"
+        ).fetchall()
+        return [pair_payload(conn, r) for r in rows]
+
+
+@app.post("/api/pairs", status_code=201)
+def create_pair(body: PairIn, user: dict = Depends(require_writer)):
+    if body.experiment_batch_id == body.control_batch_id:
+        raise HTTPException(status_code=400, detail="实验锅与对照锅不能是同一笔")
+    with connect() as conn:
+        for batch_id in (body.experiment_batch_id, body.control_batch_id):
+            exists = conn.execute("SELECT 1 FROM batches WHERE id = %s", (batch_id,)).fetchone()
+            if not exists:
+                raise HTTPException(status_code=404, detail=f"记录 {batch_id} 不存在")
+        dup = conn.execute(
+            """SELECT 1 FROM pot_pairs
+               WHERE unbound_at IS NULL AND experiment_batch_id = %s AND control_batch_id = %s""",
+            (body.experiment_batch_id, body.control_batch_id),
+        ).fetchone()
+        if dup:
+            raise HTTPException(status_code=409, detail="该对照已存在")
+        pair = conn.execute(
+            """INSERT INTO pot_pairs (experiment_batch_id, control_batch_id, created_by, created_at)
+               VALUES (%s, %s, %s, %s) RETURNING *""",
+            (body.experiment_batch_id, body.control_batch_id, user["username"], datetime.now(timezone.utc)),
+        ).fetchone()
+        conn.commit()
+        return pair_payload(conn, pair)
+
+
+@app.post("/api/pairs/{pair_id}/unbind")
+def unbind_pair(pair_id: int, user: dict = Depends(require_writer)):
+    with connect() as conn:
+        pair = conn.execute("SELECT * FROM pot_pairs WHERE id = %s", (pair_id,)).fetchone()
+        if pair is None:
+            raise HTTPException(status_code=404, detail="对照不存在")
+        if pair["unbound_at"] is not None:
+            raise HTTPException(status_code=409, detail="对照已解除")
+        pair = conn.execute(
+            """UPDATE pot_pairs SET unbound_by = %s, unbound_at = %s
+               WHERE id = %s RETURNING *""",
+            (user["username"], datetime.now(timezone.utc), pair_id),
+        ).fetchone()
+        conn.commit()
+        return pair_payload(conn, pair)

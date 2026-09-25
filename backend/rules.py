@@ -1,6 +1,10 @@
-def judge(doc: dict) -> tuple[str, str]:
+def fry_step(doc: dict) -> dict | None:
     steps = doc.get("steps") or []
-    fry = next((s for s in steps if s.get("name") == "清炒"), None)
+    return next((s for s in steps if s.get("name") == "清炒"), None)
+
+
+def judge(doc: dict) -> tuple[str, str]:
+    fry = fry_step(doc)
     if fry is None:
         return "未放行", "缺少清炒工序"
     temp = float(fry.get("temp_c", 0))
