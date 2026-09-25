@@ -1,13 +1,18 @@
 <script>
+  import ComparePage from './ComparePage.svelte'
+
   let username = 'processor'
   let password = 'herb123456'
   let token = localStorage.getItem('herb_token') || ''
   let role = localStorage.getItem('herb_role') || ''
+  let route = window.location.hash
   let rows = []
   let herb = '白芍'
   let tempC = 110
   let minutes = 10
   let error = ''
+
+  window.addEventListener('hashchange', () => (route = window.location.hash))
 
   async function api(path, options = {}) {
     const res = await fetch(path, {
@@ -58,6 +63,7 @@
     localStorage.clear()
     token = ''
     role = ''
+    window.location.hash = ''
   }
 
   if (token) load()
@@ -72,26 +78,98 @@
     <button on:click={enter}>登录</button>
     <p>processor / herb123456 可写；checker / check123456 只读</p>
   {:else}
-    <p>
-      <button on:click={leave}>退出</button>
-    </p>
-    {#if role === 'writer'}
-      <input bind:value={herb} placeholder="饮片" />
-      <input type="number" bind:value={tempC} />
-      <input type="number" bind:value={minutes} />
-      <button on:click={save}>写入清炒记录</button>
-      {#if error}<p>{error}</p>{/if}
+    <nav class="topbar">
+      <a class:active={!route || route === '#' || route === '#/'} href="#/">炮制记录</a>
+      <a class:active={route.startsWith('#/compare')} href="#/compare">联锅对照</a>
+      <button class="logout" on:click={leave}>退出</button>
+    </nav>
+
+    {#if route.startsWith('#/compare')}
+      <ComparePage {token} {role} />
+    {:else}
+      {#if role === 'writer'}
+        <section class="entry">
+          <h3>写入清炒记录</h3>
+          <input bind:value={herb} placeholder="饮片" />
+          <input type="number" bind:value={tempC} placeholder="温度℃" />
+          <input type="number" bind:value={minutes} placeholder="时长(分)" />
+          <button on:click={save}>写入清炒记录</button>
+          {#if error}<p class="error">{error}</p>{/if}
+        </section>
+      {/if}
+      <h3>锅次记录（编号用于联锅对照）</h3>
+      <ul class="batches">
+        {#each rows as row}
+          <li>
+            <span class="pot-no">#{row.id}</span>
+            {row.herb} · 温度 {row.doc.steps[0].temp_c}℃ · 时长 {row.doc.steps[0].minutes}分
+            · <span class:pass={row.verdict === '放行'} class:reject={row.verdict !== '放行'}>{row.verdict}</span>
+            · {row.reason}
+          </li>
+        {/each}
+      </ul>
     {/if}
-    <ul>
-      {#each rows as row}
-        <li>{row.herb} · {row.verdict} · {row.reason} · 温度 {row.doc.steps[0].temp_c}</li>
-      {/each}
-    </ul>
   {/if}
 </main>
 
 <style>
-  main { font-family: sans-serif; max-width: 720px; margin: 24px auto; color: #3f2f1f; }
-  h1 { color: #7c2d12; }
-  input { margin-right: 8px; padding: 6px; }
+  main {
+    font-family: sans-serif;
+    max-width: 960px;
+    margin: 24px auto;
+    color: #3f2f1f;
+  }
+  h1 {
+    color: #7c2d12;
+  }
+  .topbar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    border-bottom: 2px solid #d6c3ad;
+    padding-bottom: 8px;
+    margin-bottom: 16px;
+  }
+  .topbar a {
+    text-decoration: none;
+    color: #6b5740;
+    padding: 4px 10px;
+    border-radius: 6px;
+  }
+  .topbar a.active {
+    background: #7c2d12;
+    color: #fff;
+  }
+  .topbar .logout {
+    margin-left: auto;
+  }
+  .entry input {
+    margin-right: 8px;
+    padding: 6px;
+  }
+  .error {
+    color: #b91c1c;
+  }
+  .batches {
+    padding-left: 0;
+    list-style: none;
+  }
+  .batches li {
+    padding: 6px 8px;
+    border-bottom: 1px solid #ece1cf;
+  }
+  .pot-no {
+    display: inline-block;
+    min-width: 2.6em;
+    font-weight: bold;
+    color: #7c2d12;
+  }
+  .pass {
+    color: #166534;
+    font-weight: bold;
+  }
+  .reject {
+    color: #b91c1c;
+    font-weight: bold;
+  }
 </style>
